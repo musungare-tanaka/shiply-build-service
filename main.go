@@ -1,24 +1,52 @@
 package main
 
 import (
+	"context"
+	"log"
 	"net/http"
-
-	"github.com/gin-gonic/gin"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
 )
 
-type Server struct {
-	Data string  `json: "data"`
-}
-
-
-func getGreeting(c *gin.Context) {
-	c.IndentedJSON(http.StatusOK, Server{Data: "Hello, World!"})
-}
-
 func main() {
-	router := gin.Default()
+	cfg := loadConfig()
 
-	router.GET("/greet", getGreeting)
+	consumer, err := NewBuildConsumer(cfg)
+	if err != nil {
+		log.Fatalf("failed to initialize build consumer: %v", err)
+	}
+	defer consumer.Close()
 
-	router.Run("localhost:8081")
+	go func() {
+		if err := consumer.Start(); err != nil {
+			log.Fatalf("build consumer stopped: %v", err)
+		}
+	}()
+
+	server := &http.Server{
+		Addr:              ":" + cfg.HTTPPort,
+		ReadHeaderTimeout: 5 * time.Second,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		}),
+	}
+
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatalf("http server stopped: %v", err)
+		}
+	}()
+
+	log.Printf("build worker listening on :%s and consuming %s", cfg.HTTPPort, cfg.ApplicationBuildQueue)
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+	<-stop
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = server.Shutdown(ctx)
 }
