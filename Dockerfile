@@ -13,7 +13,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -o /app/build-service ./main.go
 FROM debian:bookworm-slim
 WORKDIR /app
 
-ARG NIXPACKS_VERSION=1.39.1
+ARG NIXPACKS_VERSION=1.41.0
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git gnupg \
@@ -24,9 +24,10 @@ RUN apt-get update \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends docker-ce-cli \
-    && curl -fsSL "https://github.com/railwayapp/nixpacks/releases/download/v${NIXPACKS_VERSION}/nixpacks-x86_64-unknown-linux-musl.tar.gz" \
+    && curl -fsSL "https://github.com/railwayapp/nixpacks/releases/download/v${NIXPACKS_VERSION}/nixpacks-v${NIXPACKS_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
         | tar -xz -C /usr/local/bin nixpacks \
     && chmod 0755 /usr/local/bin/nixpacks \
+    && nixpacks --version \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /app/build-service /app/build-service
