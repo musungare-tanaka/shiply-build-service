@@ -1,5 +1,5 @@
 # -------- Build stage --------
-FROM golang:1.25.1-bookworm AS build
+FROM golang:1.25.11-bookworm AS build
 WORKDIR /app
 
 COPY go.mod go.sum ./
@@ -7,7 +7,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /app/build-service ./main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -o /app/build-service .
 
 # -------- Runtime stage --------
 FROM debian:bookworm-slim
