@@ -62,15 +62,21 @@ func TestProcessDeliveryAcksAfterPublishingBuildSucceeded(t *testing.T) {
 	var published any
 	consumer := &BuildConsumer{
 		cfg: Config{
+			DeploymentExchange:       "deployment.events",
+			RabbitMQExchange:         "shiply.services",
+			BuildStartedRoutingKey:   "build.started",
 			BuildSucceededRoutingKey: "build.succeeded",
 		},
 		cloneRepositoryFn: func(_ ApplicationBuildRequestedPayload, repositoryDir string) error {
 			return os.MkdirAll(repositoryDir, 0o755)
 		},
 		buildExecutor: buildExecutor,
-		publishFn: func(_ context.Context, routingKey string, event any) error {
-			if routingKey != "build.succeeded" {
-				t.Fatalf("unexpected routing key %q", routingKey)
+		publishFn: func(_ context.Context, exchange, routingKey string, event any) error {
+			if exchange == "deployment.events" {
+				return nil
+			}
+			if exchange != "shiply.services" || routingKey != "build.succeeded" {
+				t.Fatalf("unexpected publish target %q %q", exchange, routingKey)
 			}
 			published = event
 			return nil
@@ -107,6 +113,9 @@ func TestProcessDeliveryAcksAfterPublishingBuildSucceeded(t *testing.T) {
 	if event.Payload.ContainerPort != 8080 {
 		t.Fatalf("unexpected container port %d", event.Payload.ContainerPort)
 	}
+	if event.DeploymentID != "deployment-1" {
+		t.Fatalf("unexpected deployment id %q", event.DeploymentID)
+	}
 	if _, err := os.Stat(buildExecutor.workDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected workdir to be cleaned up, stat err=%v", err)
 	}
@@ -127,15 +136,21 @@ func TestProcessDeliveryPublishesBuildFailureAndAcks(t *testing.T) {
 	var published any
 	consumer := &BuildConsumer{
 		cfg: Config{
-			BuildFailedRoutingKey: "build.failed",
+			DeploymentExchange:     "deployment.events",
+			RabbitMQExchange:       "shiply.services",
+			BuildStartedRoutingKey: "build.started",
+			BuildFailedRoutingKey:  "build.failed",
 		},
 		cloneRepositoryFn: func(_ ApplicationBuildRequestedPayload, repositoryDir string) error {
 			return os.MkdirAll(repositoryDir, 0o755)
 		},
 		buildExecutor: buildExecutor,
-		publishFn: func(_ context.Context, routingKey string, event any) error {
-			if routingKey != "build.failed" {
-				t.Fatalf("unexpected routing key %q", routingKey)
+		publishFn: func(_ context.Context, exchange, routingKey string, event any) error {
+			if exchange == "deployment.events" {
+				return nil
+			}
+			if exchange != "shiply.services" || routingKey != "build.failed" {
+				t.Fatalf("unexpected publish target %q %q", exchange, routingKey)
 			}
 			published = event
 			return nil
@@ -173,6 +188,9 @@ func TestProcessDeliveryRequeuesWhenPublishingResultFails(t *testing.T) {
 
 	consumer := &BuildConsumer{
 		cfg: Config{
+			DeploymentExchange:       "deployment.events",
+			RabbitMQExchange:         "shiply.services",
+			BuildStartedRoutingKey:   "build.started",
 			BuildSucceededRoutingKey: "build.succeeded",
 		},
 		cloneRepositoryFn: func(_ ApplicationBuildRequestedPayload, repositoryDir string) error {
@@ -185,7 +203,7 @@ func TestProcessDeliveryRequeuesWhenPublishingResultFails(t *testing.T) {
 				Builder:   "nixpacks",
 			},
 		},
-		publishFn: func(_ context.Context, routingKey string, event any) error {
+		publishFn: func(_ context.Context, exchange, routingKey string, event any) error {
 			return errors.New("rabbitmq unavailable")
 		},
 	}
@@ -229,12 +247,14 @@ func mustMarshalBuildRequest(t *testing.T) []byte {
 	t.Helper()
 
 	event := ServiceEvent[ApplicationBuildRequestedPayload]{
-		EventID:   "request-1",
-		EventType: "app.build.requested",
-		Timestamp: json.RawMessage(`"2026-08-08T10:00:00Z"`),
-		ProjectID: "project-1",
-		ServiceID: "service-1",
-		UserID:    "user-1",
+		EventID:      "request-1",
+		EventType:    "app.build.requested",
+		Timestamp:    json.RawMessage(`"2026-08-08T10:00:00Z"`),
+		DeploymentID: "deployment-1",
+		ProjectID:    "project-1",
+		ServiceID:    "service-1",
+		ServiceName:  "Shiply API",
+		UserID:       "user-1",
 		Payload: ApplicationBuildRequestedPayload{
 			RepositoryURL: "https://github.com/shiply/example.git",
 			Branch:        "main",

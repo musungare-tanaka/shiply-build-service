@@ -8,9 +8,38 @@ import (
 )
 
 const (
-	buildSucceededEventType = "build.succeeded"
-	buildFailedEventType    = "build.failed"
+	buildSucceededEventType           = "build.succeeded"
+	buildFailedEventType              = "build.failed"
+	deploymentBuildStartedEventType   = "deployment.build.started"
+	deploymentBuildSucceededEventType = "deployment.build.succeeded"
+	deploymentBuildFailedEventType    = "deployment.build.failed"
+	buildingStatus                    = "BUILDING"
+	buildSucceededStatus              = "BUILD_SUCCEEDED"
+	buildFailedStatus                 = "BUILD_FAILED"
 )
+
+type ServiceEvent[T any] struct {
+	EventID      string          `json:"eventId"`
+	EventType    string          `json:"eventType"`
+	Timestamp    json.RawMessage `json:"timestamp"`
+	DeploymentID string          `json:"deploymentId,omitempty"`
+	ProjectID    string          `json:"projectId"`
+	ServiceID    string          `json:"serviceId"`
+	ServiceName  string          `json:"serviceName,omitempty"`
+	UserID       string          `json:"userId"`
+	Payload      T               `json:"payload"`
+}
+
+type DeploymentEvent struct {
+	EventID      string         `json:"eventId"`
+	DeploymentID string         `json:"deploymentId"`
+	ProjectID    string         `json:"projectId"`
+	ServiceName  string         `json:"serviceName"`
+	EventType    string         `json:"eventType"`
+	Status       string         `json:"status"`
+	Timestamp    time.Time      `json:"timestamp"`
+	Metadata     map[string]any `json:"metadata,omitempty"`
+}
 
 type BuildSucceededPayload struct {
 	ImageTag      string `json:"imageTag"`
@@ -33,12 +62,14 @@ func newBuildSucceededEvent(
 	result BuildResult,
 ) ServiceEvent[BuildSucceededPayload] {
 	return ServiceEvent[BuildSucceededPayload]{
-		EventID:   newEventID(),
-		EventType: buildSucceededEventType,
-		Timestamp: marshalTimestamp(time.Now().UTC()),
-		ProjectID: request.ProjectID,
-		ServiceID: request.ServiceID,
-		UserID:    request.UserID,
+		EventID:      newEventID(),
+		EventType:    buildSucceededEventType,
+		Timestamp:    marshalTimestamp(time.Now().UTC()),
+		DeploymentID: request.DeploymentID,
+		ProjectID:    request.ProjectID,
+		ServiceID:    request.ServiceID,
+		ServiceName:  firstNonEmpty(request.ServiceName, request.Payload.ServiceAlias),
+		UserID:       request.UserID,
 		Payload: BuildSucceededPayload{
 			ImageTag:      result.ImageTag,
 			CommitSHA:     result.CommitSHA,
@@ -56,12 +87,14 @@ func newBuildFailedEvent(
 	err error,
 ) ServiceEvent[BuildFailedPayload] {
 	return ServiceEvent[BuildFailedPayload]{
-		EventID:   newEventID(),
-		EventType: buildFailedEventType,
-		Timestamp: marshalTimestamp(time.Now().UTC()),
-		ProjectID: request.ProjectID,
-		ServiceID: request.ServiceID,
-		UserID:    request.UserID,
+		EventID:      newEventID(),
+		EventType:    buildFailedEventType,
+		Timestamp:    marshalTimestamp(time.Now().UTC()),
+		DeploymentID: request.DeploymentID,
+		ProjectID:    request.ProjectID,
+		ServiceID:    request.ServiceID,
+		ServiceName:  firstNonEmpty(request.ServiceName, request.Payload.ServiceAlias),
+		UserID:       request.UserID,
 		Payload: BuildFailedPayload{
 			ImageTag:     result.ImageTag,
 			CommitSHA:    result.CommitSHA,
@@ -69,6 +102,82 @@ func newBuildFailedEvent(
 			ErrorMessage: redact(err.Error()),
 		},
 	}
+}
+
+func newBuildStartedDeploymentEvent(request ServiceEvent[ApplicationBuildRequestedPayload]) DeploymentEvent {
+	return DeploymentEvent{
+		EventID:      newEventID(),
+		DeploymentID: request.DeploymentID,
+		ProjectID:    request.ProjectID,
+		ServiceName:  firstNonEmpty(request.ServiceName, request.Payload.ServiceAlias),
+		EventType:    deploymentBuildStartedEventType,
+		Status:       buildingStatus,
+		Timestamp:    time.Now().UTC(),
+		Metadata: map[string]any{
+			"serviceId":     request.ServiceID,
+			"branch":        request.Payload.Branch,
+			"repositoryUrl": request.Payload.RepositoryURL,
+		},
+	}
+}
+
+func newBuildSucceededDeploymentEvent(
+	request ServiceEvent[ApplicationBuildRequestedPayload],
+	result BuildResult,
+) DeploymentEvent {
+	return DeploymentEvent{
+		EventID:      newEventID(),
+		DeploymentID: request.DeploymentID,
+		ProjectID:    request.ProjectID,
+		ServiceName:  firstNonEmpty(request.ServiceName, request.Payload.ServiceAlias),
+		EventType:    deploymentBuildSucceededEventType,
+		Status:       buildSucceededStatus,
+		Timestamp:    time.Now().UTC(),
+		Metadata: map[string]any{
+			"serviceId":     request.ServiceID,
+			"imageTag":      result.ImageTag,
+			"commitSha":     result.CommitSHA,
+			"builder":       result.Builder,
+			"projectSlug":   request.Payload.ProjectSlug,
+			"serviceSlug":   request.Payload.ServiceSlug,
+			"containerPort": request.Payload.ContainerPort,
+		},
+	}
+}
+
+func newBuildFailedDeploymentEvent(
+	request ServiceEvent[ApplicationBuildRequestedPayload],
+	result BuildResult,
+	err error,
+) DeploymentEvent {
+	return DeploymentEvent{
+		EventID:      newEventID(),
+		DeploymentID: request.DeploymentID,
+		ProjectID:    request.ProjectID,
+		ServiceName:  firstNonEmpty(request.ServiceName, request.Payload.ServiceAlias),
+		EventType:    deploymentBuildFailedEventType,
+		Status:       buildFailedStatus,
+		Timestamp:    time.Now().UTC(),
+		Metadata: map[string]any{
+			"serviceId":     request.ServiceID,
+			"imageTag":      result.ImageTag,
+			"commitSha":     result.CommitSHA,
+			"builder":       result.Builder,
+			"errorMessage":  redact(err.Error()),
+			"projectSlug":   request.Payload.ProjectSlug,
+			"serviceSlug":   request.Payload.ServiceSlug,
+			"containerPort": request.Payload.ContainerPort,
+		},
+	}
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func marshalTimestamp(timestamp time.Time) json.RawMessage {

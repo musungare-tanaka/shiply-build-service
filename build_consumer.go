@@ -15,7 +15,7 @@ import (
 	"github.com/rabbitmq/amqp091-go"
 )
 
-type publishFunc func(context.Context, string, any) error
+type publishFunc func(context.Context, string, string, any) error
 
 type deliveryAction struct {
 	ack     bool
@@ -32,20 +32,11 @@ type BuildConsumer struct {
 	cfg  Config
 	conn *amqp091.Connection
 	ch   *amqp091.Channel
+	pub  *RabbitPublisher
 
 	cloneRepositoryFn func(ApplicationBuildRequestedPayload, string) error
 	buildExecutor     BuildExecutor
 	publishFn         publishFunc
-}
-
-type ServiceEvent[T any] struct {
-	EventID   string          `json:"eventId"`
-	EventType string          `json:"eventType"`
-	Timestamp json.RawMessage `json:"timestamp"`
-	ProjectID string          `json:"projectId"`
-	ServiceID string          `json:"serviceId"`
-	UserID    string          `json:"userId"`
-	Payload   T               `json:"payload"`
 }
 
 type ApplicationBuildRequestedPayload struct {
@@ -102,10 +93,21 @@ func NewBuildConsumer(cfg Config) (*BuildConsumer, error) {
 		return nil, fmt.Errorf("set qos: %w", err)
 	}
 
+	publisher, err := NewRabbitPublisher(conn, []ExchangeSpec{
+		{Name: cfg.RabbitMQExchange, Kind: "direct"},
+		{Name: cfg.DeploymentExchange, Kind: "topic"},
+	})
+	if err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, fmt.Errorf("initialize publisher: %w", err)
+	}
+
 	consumer := &BuildConsumer{
 		cfg:           cfg,
 		conn:          conn,
 		ch:            ch,
+		pub:           publisher,
 		buildExecutor: NewCommandBuilder(cfg),
 	}
 	consumer.cloneRepositoryFn = consumer.cloneRepository
@@ -114,6 +116,9 @@ func NewBuildConsumer(cfg Config) (*BuildConsumer, error) {
 }
 
 func (c *BuildConsumer) Close() {
+	if c.pub != nil {
+		_ = c.pub.Close()
+	}
 	if c.ch != nil {
 		_ = c.ch.Close()
 	}
@@ -164,6 +169,17 @@ func (c *BuildConsumer) handleMessage(body []byte) (deliveryAction, error) {
 
 func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequestedPayload]) (deliveryAction, error) {
 	payload := event.Payload
+	if err := validateBuildPayload(payload); err != nil {
+		return c.completeFailure(event, BuildResult{}, err)
+	}
+
+	startedEvent := newBuildStartedDeploymentEvent(event)
+	startedCtx, cancelStarted := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelStarted()
+	if err := c.publishEvent(startedCtx, c.cfg.DeploymentExchange, c.cfg.BuildStartedRoutingKey, startedEvent); err != nil {
+		return actionNackRequeue, fmt.Errorf("publish build started event: %w", err)
+	}
+
 	targetDir, err := os.MkdirTemp("", "shiply-build-*")
 	if err != nil {
 		return c.completeFailure(event, BuildResult{}, fmt.Errorf("create workdir: %w", err))
@@ -210,8 +226,11 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 	}
 
 	successEvent := newBuildSucceededEvent(event, result)
-	if err := c.publishEvent(ctx, c.cfg.BuildSucceededRoutingKey, successEvent); err != nil {
+	if err := c.publishEvent(ctx, c.cfg.RabbitMQExchange, c.cfg.BuildSucceededRoutingKey, successEvent); err != nil {
 		return actionNackRequeue, fmt.Errorf("publish build succeeded event: %w", err)
+	}
+	if err := c.publishEvent(ctx, c.cfg.DeploymentExchange, c.cfg.BuildSucceededRoutingKey, newBuildSucceededDeploymentEvent(event, result)); err != nil {
+		return actionNackRequeue, fmt.Errorf("publish deployment build succeeded event: %w", err)
 	}
 
 	log.Printf(
@@ -233,41 +252,29 @@ func (c *BuildConsumer) completeFailure(
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
-	if err := c.publishEvent(ctx, c.cfg.BuildFailedRoutingKey, failureEvent); err != nil {
+	if err := c.publishEvent(ctx, c.cfg.RabbitMQExchange, c.cfg.BuildFailedRoutingKey, failureEvent); err != nil {
 		return actionNackRequeue, fmt.Errorf("%v; publish build failed event: %w", buildErr, err)
+	}
+	if err := c.publishEvent(ctx, c.cfg.DeploymentExchange, c.cfg.BuildFailedRoutingKey, newBuildFailedDeploymentEvent(event, result, buildErr)); err != nil {
+		return actionNackRequeue, fmt.Errorf("%v; publish deployment build failed event: %w", buildErr, err)
 	}
 
 	return actionAck, buildErr
 }
 
-func (c *BuildConsumer) publishEvent(ctx context.Context, routingKey string, event any) error {
+func (c *BuildConsumer) publishEvent(ctx context.Context, exchange, routingKey string, event any) error {
 	publish := c.publishFn
 	if publish == nil {
 		publish = c.publishJSONEvent
 	}
-	return publish(ctx, routingKey, event)
+	return publish(ctx, exchange, routingKey, event)
 }
 
-func (c *BuildConsumer) publishJSONEvent(ctx context.Context, routingKey string, event any) error {
-	if c.ch == nil {
-		return errors.New("rabbitmq channel is not initialized")
+func (c *BuildConsumer) publishJSONEvent(ctx context.Context, exchange, routingKey string, event any) error {
+	if c.pub == nil {
+		return errors.New("rabbitmq publisher is not initialized")
 	}
-
-	body, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshal event payload: %w", err)
-	}
-
-	if err := c.ch.PublishWithContext(ctx, c.cfg.RabbitMQExchange, routingKey, false, false, amqp091.Publishing{
-		ContentType:  "application/json",
-		DeliveryMode: amqp091.Persistent,
-		Timestamp:    time.Now().UTC(),
-		Body:         body,
-	}); err != nil {
-		return fmt.Errorf("publish rabbitmq event: %w", err)
-	}
-
-	return nil
+	return c.pub.PublishJSON(ctx, exchange, routingKey, event)
 }
 
 func (c *BuildConsumer) cloneRepository(payload ApplicationBuildRequestedPayload, repositoryDir string) error {
@@ -343,6 +350,13 @@ func sanitizeName(value string) string {
 	}
 	replacer := strings.NewReplacer("/", "-", "\\", "-", " ", "-")
 	return replacer.Replace(trimmed)
+}
+
+func validateBuildPayload(payload ApplicationBuildRequestedPayload) error {
+	if strings.TrimSpace(payload.CloneURL) == "" && strings.TrimSpace(payload.RepositoryURL) == "" {
+		return errors.New("missing clone url")
+	}
+	return nil
 }
 
 func redact(value string) string {

@@ -13,10 +13,12 @@ type Config struct {
 	HTTPPort                 string
 	RabbitMQURL              string
 	RabbitMQExchange         string
+	DeploymentExchange       string
 	ApplicationBuildQueue    string
 	ApplicationRoutingKey    string
 	BuildSucceededRoutingKey string
 	BuildFailedRoutingKey    string
+	BuildStartedRoutingKey   string
 	GitHubAppID              string
 	GitHubPrivateKey         string
 	GitHubPrivateKeyB64      string
@@ -28,8 +30,10 @@ func loadConfig() Config {
 		HTTPPort:                 envOrDefault("PORT", "8081"),
 		RabbitMQURL:              envOrDefault("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"),
 		RabbitMQExchange:         envOrDefault("RABBITMQ_EXCHANGE", "shiply.services"),
+		DeploymentExchange:       envOrDefault("RABBITMQ_DEPLOYMENT_EXCHANGE", "deployment.events"),
 		ApplicationBuildQueue:    envOrDefault("RABBITMQ_APP_BUILD_QUEUE", "shiply.app.build"),
 		ApplicationRoutingKey:    envOrDefault("RABBITMQ_APP_BUILD_ROUTING_KEY", "app.build.requested"),
+		BuildStartedRoutingKey:   envOrDefault("RABBITMQ_BUILD_STARTED_ROUTING_KEY", "build.started"),
 		BuildSucceededRoutingKey: envOrDefault("RABBITMQ_BUILD_SUCCEEDED_ROUTING_KEY", "build.succeeded"),
 		BuildFailedRoutingKey:    envOrDefault("RABBITMQ_BUILD_FAILED_ROUTING_KEY", "build.failed"),
 		GitHubAppID:              os.Getenv("GITHUB_APP_ID"),
