@@ -121,7 +121,7 @@ func TestProcessDeliveryAcksAfterPublishingBuildSucceeded(t *testing.T) {
 	}
 }
 
-func TestProcessDeliveryPublishesBuildFailureAndAcks(t *testing.T) {
+func TestProcessDeliveryRetriesBuildFailure(t *testing.T) {
 	t.Parallel()
 
 	buildExecutor := &stubBuildExecutor{
@@ -133,7 +133,6 @@ func TestProcessDeliveryPublishesBuildFailureAndAcks(t *testing.T) {
 		err: errors.New("docker push failed"),
 	}
 
-	var published any
 	consumer := &BuildConsumer{
 		cfg: Config{
 			DeploymentExchange:     "deployment.events",
@@ -145,16 +144,7 @@ func TestProcessDeliveryPublishesBuildFailureAndAcks(t *testing.T) {
 			return os.MkdirAll(repositoryDir, 0o755)
 		},
 		buildExecutor: buildExecutor,
-		publishFn: func(_ context.Context, exchange, routingKey string, event any) error {
-			if exchange == "deployment.events" {
-				return nil
-			}
-			if exchange != "shiply.services" || routingKey != "build.failed" {
-				t.Fatalf("unexpected publish target %q %q", exchange, routingKey)
-			}
-			published = event
-			return nil
-		},
+		publishFn:     func(_ context.Context, _, _ string, _ any) error { return nil },
 	}
 
 	recorder := &ackRecorder{}
@@ -164,19 +154,11 @@ func TestProcessDeliveryPublishesBuildFailureAndAcks(t *testing.T) {
 		DeliveryTag:  2,
 	})
 
-	if recorder.ackCount != 1 {
-		t.Fatalf("expected ack once, got %d", recorder.ackCount)
+	if recorder.ackCount != 0 {
+		t.Fatalf("expected no ack, got %d", recorder.ackCount)
 	}
-	if recorder.nackCount != 0 {
-		t.Fatalf("expected no nack, got %d", recorder.nackCount)
-	}
-
-	event, ok := published.(ServiceEvent[BuildFailedPayload])
-	if !ok {
-		t.Fatalf("expected a failure event, got %T", published)
-	}
-	if event.Payload.ErrorMessage != "docker push failed" {
-		t.Fatalf("unexpected failure message %q", event.Payload.ErrorMessage)
+	if recorder.nackCount != 1 || !recorder.lastRequeue {
+		t.Fatalf("expected nack with requeue, got nack=%d requeue=%v", recorder.nackCount, recorder.lastRequeue)
 	}
 	if _, err := os.Stat(buildExecutor.workDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected workdir to be cleaned up, stat err=%v", err)

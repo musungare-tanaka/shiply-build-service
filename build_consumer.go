@@ -273,7 +273,7 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 		WorkDir:       targetDir,
 	})
 	if err != nil {
-		return c.completeFailure(event, result, err)
+		return actionNackRequeue, err
 	}
 
 	successEvent := newBuildSucceededEvent(event, result)
