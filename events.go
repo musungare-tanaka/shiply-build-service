@@ -63,7 +63,7 @@ func newBuildSucceededEvent(
 	result BuildResult,
 ) ServiceEvent[BuildSucceededPayload] {
 	return ServiceEvent[BuildSucceededPayload]{
-		EventID:      newEventID(),
+		EventID:      deploymentEventID(request.DeploymentID, "build", buildSucceededStatus),
 		EventType:    buildSucceededEventType,
 		Timestamp:    marshalTimestamp(time.Now().UTC()),
 		DeploymentID: request.DeploymentID,
@@ -88,7 +88,7 @@ func newBuildFailedEvent(
 	err error,
 ) ServiceEvent[BuildFailedPayload] {
 	return ServiceEvent[BuildFailedPayload]{
-		EventID:      newEventID(),
+		EventID:      deploymentEventID(request.DeploymentID, "build", buildFailedStatus),
 		EventType:    buildFailedEventType,
 		Timestamp:    marshalTimestamp(time.Now().UTC()),
 		DeploymentID: request.DeploymentID,

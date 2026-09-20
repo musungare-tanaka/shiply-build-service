@@ -29,14 +29,22 @@ var (
 )
 
 type BuildConsumer struct {
-	cfg  Config
-	conn *amqp091.Connection
-	ch   *amqp091.Channel
-	pub  *RabbitPublisher
+	cfg    Config
+	conn   *amqp091.Connection
+	ch     *amqp091.Channel
+	pub    *RabbitPublisher
+	ledger StageLedger
 
 	cloneRepositoryFn func(ApplicationBuildRequestedPayload, string) error
 	buildExecutor     BuildExecutor
 	publishFn         publishFunc
+}
+
+type buildResultEvents struct {
+	ServiceRoutingKey  string          `json:"serviceRoutingKey"`
+	ServiceEvent       json.RawMessage `json:"serviceEvent"`
+	ProgressRoutingKey string          `json:"progressRoutingKey"`
+	ProgressEvent      json.RawMessage `json:"progressEvent"`
 }
 
 type ApplicationBuildRequestedPayload struct {
@@ -86,6 +94,11 @@ func NewBuildConsumer(cfg Config) (*BuildConsumer, error) {
 		conn.Close()
 		return nil, fmt.Errorf("bind queue: %w", err)
 	}
+	if err := declareRetryTopology(ch, cfg); err != nil {
+		ch.Close()
+		conn.Close()
+		return nil, err
+	}
 
 	if err := ch.Qos(1, 0, false); err != nil {
 		ch.Close()
@@ -110,12 +123,21 @@ func NewBuildConsumer(cfg Config) (*BuildConsumer, error) {
 		pub:           publisher,
 		buildExecutor: NewCommandBuilder(cfg),
 	}
+	ledger, err := NewPostgresStageLedger(context.Background(), cfg.DatabaseURL, cfg.LedgerSchema)
+	if err != nil {
+		consumer.Close()
+		return nil, fmt.Errorf("initialize stage ledger: %w", err)
+	}
+	consumer.ledger = ledger
 	consumer.cloneRepositoryFn = consumer.cloneRepository
 	consumer.publishFn = consumer.publishJSONEvent
 	return consumer, nil
 }
 
 func (c *BuildConsumer) Close() {
+	if c.ledger != nil {
+		_ = c.ledger.Close()
+	}
 	if c.pub != nil {
 		_ = c.pub.Close()
 	}
@@ -153,6 +175,18 @@ func (c *BuildConsumer) processDelivery(msg amqp091.Delivery) {
 		return
 	}
 
+	if action.requeue && c.ch != nil {
+		if retryErr := c.scheduleRetry(msg, err); retryErr == nil {
+			_ = msg.Ack(false)
+			return
+		}
+	}
+	if !action.requeue && c.ch != nil {
+		if dlqErr := c.copyToDLQ(msg, err); dlqErr == nil {
+			_ = msg.Ack(false)
+			return
+		}
+	}
 	if nackErr := msg.Nack(false, action.requeue); nackErr != nil {
 		log.Printf("nack failed: %v", nackErr)
 	}
@@ -168,9 +202,24 @@ func (c *BuildConsumer) handleMessage(body []byte) (deliveryAction, error) {
 }
 
 func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequestedPayload]) (deliveryAction, error) {
+	if strings.TrimSpace(event.DeploymentID) == "" {
+		return actionNackDrop, errors.New("missing deploymentId")
+	}
 	payload := event.Payload
 	if err := validateBuildPayload(payload); err != nil {
-		return c.completeFailure(event, BuildResult{}, err)
+		return actionNackDrop, err
+	}
+	if c.ledger != nil {
+		disposition, record, err := c.ledger.Claim(context.Background(), event.DeploymentID, "build", c.cfg.LeaseDuration)
+		if err != nil {
+			return actionNackRequeue, fmt.Errorf("claim build stage: %w", err)
+		}
+		switch disposition {
+		case ClaimCompleted, ClaimFailed:
+			return c.publishStored(record.ResultJSON)
+		case ClaimBusy:
+			return actionNackRequeue, errors.New("build stage lease is owned by another worker")
+		}
 	}
 
 	startedEvent := newBuildStartedDeploymentEvent(event)
@@ -214,6 +263,8 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 	defer cancel()
+	stopRenew := c.startLeaseRenewal(ctx, event.DeploymentID)
+	defer stopRenew()
 
 	result, err := builder.BuildAndPush(ctx, BuildRequest{
 		ProjectID:     event.ProjectID,
@@ -226,6 +277,15 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 	}
 
 	successEvent := newBuildSucceededEvent(event, result)
+	bundle, err := makeBuildResultEvents(c.cfg.BuildSucceededRoutingKey, successEvent, c.cfg.DeploymentBuildSucceededRoutingKey, newBuildSucceededDeploymentEvent(event, result))
+	if err != nil {
+		return actionNackRequeue, err
+	}
+	if c.ledger != nil {
+		if err := c.ledger.Complete(ctx, event.DeploymentID, "build", bundle); err != nil {
+			return actionNackRequeue, fmt.Errorf("persist build result: %w", err)
+		}
+	}
 	if err := c.publishEvent(ctx, c.cfg.RabbitMQExchange, c.cfg.BuildSucceededRoutingKey, successEvent); err != nil {
 		return actionNackRequeue, fmt.Errorf("publish build succeeded event: %w", err)
 	}
@@ -243,19 +303,168 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 	return actionAck, nil
 }
 
+func makeBuildResultEvents(serviceKey string, service any, progressKey string, progress any) (buildResultEvents, error) {
+	s, e := json.Marshal(service)
+	if e != nil {
+		return buildResultEvents{}, e
+	}
+	p, e := json.Marshal(progress)
+	return buildResultEvents{serviceKey, s, progressKey, p}, e
+}
+func (c *BuildConsumer) publishStored(raw json.RawMessage) (deliveryAction, error) {
+	var b buildResultEvents
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return actionNackDrop, fmt.Errorf("decode stored build result: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return c.publishBundle(ctx, b)
+}
+func (c *BuildConsumer) publishBundle(ctx context.Context, b buildResultEvents) (deliveryAction, error) {
+	var s, p any
+	if err := json.Unmarshal(b.ServiceEvent, &s); err != nil {
+		return actionNackDrop, err
+	}
+	if err := json.Unmarshal(b.ProgressEvent, &p); err != nil {
+		return actionNackDrop, err
+	}
+	if err := c.publishEvent(ctx, c.cfg.RabbitMQExchange, b.ServiceRoutingKey, s); err != nil {
+		return actionNackRequeue, fmt.Errorf("publish stored service event: %w", err)
+	}
+	if err := c.publishProgressEvent(ctx, c.cfg.DeploymentExchange, b.ProgressRoutingKey, p); err != nil {
+		return actionNackRequeue, fmt.Errorf("publish stored progress event: %w", err)
+	}
+	return actionAck, nil
+}
+func (c *BuildConsumer) startLeaseRenewal(ctx context.Context, id string) func() {
+	if c.ledger == nil {
+		return func() {}
+	}
+	renewCtx, cancel := context.WithCancel(ctx)
+	interval := c.cfg.LeaseDuration / 3
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-renewCtx.Done():
+				return
+			case <-ticker.C:
+				_ = c.ledger.Renew(renewCtx, id, "build", c.cfg.LeaseDuration)
+			}
+		}
+	}()
+	return cancel
+}
+
+func declareRetryTopology(ch *amqp091.Channel, cfg Config) error {
+	if _, err := ch.QueueDeclare(cfg.DLQ, true, false, false, false, nil); err != nil {
+		return fmt.Errorf("declare build dlq: %w", err)
+	}
+	for i, d := range cfg.RetryBackoffs {
+		name := fmt.Sprintf("%s.%d", cfg.RetryQueuePrefix, i+1)
+		args := amqp091.Table{"x-message-ttl": int32(d / time.Millisecond), "x-dead-letter-exchange": cfg.RabbitMQExchange, "x-dead-letter-routing-key": cfg.ApplicationRoutingKey}
+		if _, err := ch.QueueDeclare(name, true, false, false, false, args); err != nil {
+			return fmt.Errorf("declare retry queue: %w", err)
+		}
+	}
+	return nil
+}
+func (c *BuildConsumer) scheduleRetry(msg amqp091.Delivery, cause error) error {
+	attempt := headerAttempt(msg.Headers) + 1
+	if attempt >= c.cfg.MaxAttempts {
+		_ = c.emitExhausted(msg.Body, cause)
+		return c.copyToDLQWithAttempt(msg, cause, attempt)
+	}
+	idx := attempt - 1
+	if idx >= len(c.cfg.RetryBackoffs) {
+		idx = len(c.cfg.RetryBackoffs) - 1
+	}
+	headers := cloneHeaders(msg.Headers)
+	headers["x-shiply-attempt"] = int32(attempt)
+	headers["x-shiply-retry-reason"] = safeReason(cause)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return c.ch.PublishWithContext(ctx, "", fmt.Sprintf("%s.%d", c.cfg.RetryQueuePrefix, idx+1), false, false, amqp091.Publishing{ContentType: msg.ContentType, DeliveryMode: amqp091.Persistent, Headers: headers, Body: msg.Body})
+}
+func (c *BuildConsumer) copyToDLQ(msg amqp091.Delivery, cause error) error {
+	return c.copyToDLQWithAttempt(msg, cause, headerAttempt(msg.Headers))
+}
+func (c *BuildConsumer) copyToDLQWithAttempt(msg amqp091.Delivery, cause error, attempt int) error {
+	h := cloneHeaders(msg.Headers)
+	h["x-shiply-dead-letter-reason"] = safeReason(cause)
+	h["x-shiply-attempt"] = int32(attempt)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return c.ch.PublishWithContext(ctx, "", c.cfg.DLQ, false, false, amqp091.Publishing{ContentType: msg.ContentType, DeliveryMode: amqp091.Persistent, Headers: h, Body: msg.Body})
+}
+func headerAttempt(h amqp091.Table) int {
+	switch v := h["x-shiply-attempt"].(type) {
+	case int32:
+		return int(v)
+	case int64:
+		return int(v)
+	case int:
+		return v
+	}
+	return 0
+}
+func cloneHeaders(h amqp091.Table) amqp091.Table {
+	r := amqp091.Table{}
+	for k, v := range h {
+		r[k] = v
+	}
+	return r
+}
+func safeReason(err error) string {
+	if err == nil {
+		return "unspecified"
+	}
+	s := redact(err.Error())
+	if len(s) > 500 {
+		return s[:500]
+	}
+	return s
+}
+func (c *BuildConsumer) emitExhausted(body []byte, cause error) error {
+	var event ServiceEvent[ApplicationBuildRequestedPayload]
+	if json.Unmarshal(body, &event) != nil {
+		return nil
+	}
+	_, err := c.completeFailure(event, BuildResult{}, fmt.Errorf("retry attempts exhausted: %w", cause))
+	if c.ledger != nil {
+		failure, _ := makeBuildResultEvents(c.cfg.BuildFailedRoutingKey, newBuildFailedEvent(event, BuildResult{}, cause), c.cfg.DeploymentBuildFailedRoutingKey, newBuildFailedDeploymentEvent(event, BuildResult{}, cause))
+		_ = c.ledger.Fail(context.Background(), event.DeploymentID, "build", failure)
+	}
+	return err
+}
+
 func (c *BuildConsumer) completeFailure(
 	event ServiceEvent[ApplicationBuildRequestedPayload],
 	result BuildResult,
 	buildErr error,
 ) (deliveryAction, error) {
 	failureEvent := newBuildFailedEvent(event, result, buildErr)
+	progressEvent := newBuildFailedDeploymentEvent(event, result, buildErr)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	if c.ledger != nil {
+		bundle, err := makeBuildResultEvents(c.cfg.BuildFailedRoutingKey, failureEvent, c.cfg.DeploymentBuildFailedRoutingKey, progressEvent)
+		if err != nil {
+			return actionNackRequeue, err
+		}
+		if err := c.ledger.Fail(ctx, event.DeploymentID, "build", bundle); err != nil {
+			return actionNackRequeue, fmt.Errorf("persist build failure: %w", err)
+		}
+	}
 
 	if err := c.publishEvent(ctx, c.cfg.RabbitMQExchange, c.cfg.BuildFailedRoutingKey, failureEvent); err != nil {
 		return actionNackRequeue, fmt.Errorf("%v; publish build failed event: %w", buildErr, err)
 	}
-	if err := c.publishProgressEvent(ctx, c.cfg.DeploymentExchange, c.cfg.DeploymentBuildFailedRoutingKey, newBuildFailedDeploymentEvent(event, result, buildErr)); err != nil {
+	if err := c.publishProgressEvent(ctx, c.cfg.DeploymentExchange, c.cfg.DeploymentBuildFailedRoutingKey, progressEvent); err != nil {
 		return actionNackRequeue, fmt.Errorf("%v; publish deployment build failed event: %w", buildErr, err)
 	}
 
