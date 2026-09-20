@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"time"
 )
 
@@ -17,6 +18,7 @@ const (
 	buildingStatus                    = "BUILDING"
 	buildSucceededStatus              = "BUILD_SUCCEEDED"
 	buildFailedStatus                 = "BUILD_FAILED"
+	buildRetryingStatus               = "BUILD_RETRYING"
 )
 
 type ServiceEvent[T any] struct {
@@ -56,6 +58,10 @@ type BuildFailedPayload struct {
 	CommitSHA    string `json:"commitSha,omitempty"`
 	Builder      string `json:"builder,omitempty"`
 	ErrorMessage string `json:"errorMessage"`
+}
+
+func newBuildRetryingDeploymentEvent(request ServiceEvent[ApplicationBuildRequestedPayload], attempt int, err error) DeploymentEvent {
+	return DeploymentEvent{EventID: deploymentEventID(request.DeploymentID, "build", fmt.Sprintf("%s:%d", buildRetryingStatus, attempt)), DeploymentID: request.DeploymentID, ProjectID: request.ProjectID, ServiceName: firstNonEmpty(request.ServiceName, request.Payload.ServiceAlias), EventType: "deployment.build.retrying", Status: buildRetryingStatus, Timestamp: time.Now().UTC(), Metadata: map[string]any{"serviceId": request.ServiceID, "attempt": attempt, "errorMessage": redact(err.Error())}}
 }
 
 func newBuildSucceededEvent(

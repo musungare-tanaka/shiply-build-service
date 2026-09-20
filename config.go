@@ -27,6 +27,7 @@ type Config struct {
 	DeploymentBuildStartedRoutingKey   string
 	DeploymentBuildSucceededRoutingKey string
 	DeploymentBuildFailedRoutingKey    string
+	DeploymentBuildRetryingRoutingKey  string
 	DatabaseURL                        string
 	LedgerSchema                       string
 	LeaseDuration                      time.Duration
@@ -54,6 +55,7 @@ func loadConfig() Config {
 		DeploymentBuildStartedRoutingKey:   envOrDefault("RABBITMQ_DEPLOYMENT_BUILD_STARTED_ROUTING_KEY", deploymentBuildStartedEventType),
 		DeploymentBuildSucceededRoutingKey: envOrDefault("RABBITMQ_DEPLOYMENT_BUILD_SUCCEEDED_ROUTING_KEY", deploymentBuildSucceededEventType),
 		DeploymentBuildFailedRoutingKey:    envOrDefault("RABBITMQ_DEPLOYMENT_BUILD_FAILED_ROUTING_KEY", deploymentBuildFailedEventType),
+		DeploymentBuildRetryingRoutingKey:  envOrDefault("RABBITMQ_DEPLOYMENT_BUILD_RETRYING_ROUTING_KEY", "deployment.build.retrying"),
 		DatabaseURL:                        os.Getenv("DATABASE_URL"),
 		LedgerSchema:                       envOrDefault("STAGE_LEDGER_SCHEMA", "build_service"),
 		LeaseDuration:                      durationOrDefault("STAGE_LEASE_DURATION", 35*time.Minute),

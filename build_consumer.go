@@ -379,6 +379,7 @@ func (c *BuildConsumer) scheduleRetry(msg amqp091.Delivery, cause error) error {
 		_ = c.emitExhausted(msg.Body, cause)
 		return c.copyToDLQWithAttempt(msg, cause, attempt)
 	}
+	_ = c.emitRetrying(msg.Body, attempt, cause)
 	idx := attempt - 1
 	if idx >= len(c.cfg.RetryBackoffs) {
 		idx = len(c.cfg.RetryBackoffs) - 1
@@ -389,6 +390,15 @@ func (c *BuildConsumer) scheduleRetry(msg amqp091.Delivery, cause error) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	return c.ch.PublishWithContext(ctx, "", fmt.Sprintf("%s.%d", c.cfg.RetryQueuePrefix, idx+1), false, false, amqp091.Publishing{ContentType: msg.ContentType, DeliveryMode: amqp091.Persistent, Headers: headers, Body: msg.Body})
+}
+func (c *BuildConsumer) emitRetrying(body []byte, attempt int, cause error) error {
+	var event ServiceEvent[ApplicationBuildRequestedPayload]
+	if json.Unmarshal(body, &event) != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return c.publishProgressEvent(ctx, c.cfg.DeploymentExchange, c.cfg.DeploymentBuildRetryingRoutingKey, newBuildRetryingDeploymentEvent(event, attempt, cause))
 }
 func (c *BuildConsumer) copyToDLQ(msg amqp091.Delivery, cause error) error {
 	return c.copyToDLQWithAttempt(msg, cause, headerAttempt(msg.Headers))
