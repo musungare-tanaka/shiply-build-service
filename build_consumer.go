@@ -176,7 +176,7 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 	startedEvent := newBuildStartedDeploymentEvent(event)
 	startedCtx, cancelStarted := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelStarted()
-	if err := c.publishEvent(startedCtx, c.cfg.DeploymentExchange, c.cfg.BuildStartedRoutingKey, startedEvent); err != nil {
+	if err := c.publishProgressEvent(startedCtx, c.cfg.DeploymentExchange, c.cfg.DeploymentBuildStartedRoutingKey, startedEvent); err != nil {
 		return actionNackRequeue, fmt.Errorf("publish build started event: %w", err)
 	}
 
@@ -229,7 +229,7 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 	if err := c.publishEvent(ctx, c.cfg.RabbitMQExchange, c.cfg.BuildSucceededRoutingKey, successEvent); err != nil {
 		return actionNackRequeue, fmt.Errorf("publish build succeeded event: %w", err)
 	}
-	if err := c.publishEvent(ctx, c.cfg.DeploymentExchange, c.cfg.BuildSucceededRoutingKey, newBuildSucceededDeploymentEvent(event, result)); err != nil {
+	if err := c.publishProgressEvent(ctx, c.cfg.DeploymentExchange, c.cfg.DeploymentBuildSucceededRoutingKey, newBuildSucceededDeploymentEvent(event, result)); err != nil {
 		return actionNackRequeue, fmt.Errorf("publish deployment build succeeded event: %w", err)
 	}
 
@@ -255,11 +255,21 @@ func (c *BuildConsumer) completeFailure(
 	if err := c.publishEvent(ctx, c.cfg.RabbitMQExchange, c.cfg.BuildFailedRoutingKey, failureEvent); err != nil {
 		return actionNackRequeue, fmt.Errorf("%v; publish build failed event: %w", buildErr, err)
 	}
-	if err := c.publishEvent(ctx, c.cfg.DeploymentExchange, c.cfg.BuildFailedRoutingKey, newBuildFailedDeploymentEvent(event, result, buildErr)); err != nil {
+	if err := c.publishProgressEvent(ctx, c.cfg.DeploymentExchange, c.cfg.DeploymentBuildFailedRoutingKey, newBuildFailedDeploymentEvent(event, result, buildErr)); err != nil {
 		return actionNackRequeue, fmt.Errorf("%v; publish deployment build failed event: %w", buildErr, err)
 	}
 
 	return actionAck, buildErr
+}
+
+func (c *BuildConsumer) publishProgressEvent(ctx context.Context, exchange, routingKey string, event any) error {
+	if c.publishFn != nil {
+		return c.publishFn(ctx, exchange, routingKey, event)
+	}
+	if c.pub == nil {
+		return errors.New("rabbitmq publisher is not initialized")
+	}
+	return c.pub.PublishProgressJSON(ctx, exchange, routingKey, event)
 }
 
 func (c *BuildConsumer) publishEvent(ctx context.Context, exchange, routingKey string, event any) error {

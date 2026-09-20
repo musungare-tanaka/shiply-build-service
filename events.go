@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"time"
@@ -106,7 +107,7 @@ func newBuildFailedEvent(
 
 func newBuildStartedDeploymentEvent(request ServiceEvent[ApplicationBuildRequestedPayload]) DeploymentEvent {
 	return DeploymentEvent{
-		EventID:      newEventID(),
+		EventID:      deploymentEventID(request.DeploymentID, "build", buildingStatus),
 		DeploymentID: request.DeploymentID,
 		ProjectID:    request.ProjectID,
 		ServiceName:  firstNonEmpty(request.ServiceName, request.Payload.ServiceAlias),
@@ -126,7 +127,7 @@ func newBuildSucceededDeploymentEvent(
 	result BuildResult,
 ) DeploymentEvent {
 	return DeploymentEvent{
-		EventID:      newEventID(),
+		EventID:      deploymentEventID(request.DeploymentID, "build", buildSucceededStatus),
 		DeploymentID: request.DeploymentID,
 		ProjectID:    request.ProjectID,
 		ServiceName:  firstNonEmpty(request.ServiceName, request.Payload.ServiceAlias),
@@ -151,7 +152,7 @@ func newBuildFailedDeploymentEvent(
 	err error,
 ) DeploymentEvent {
 	return DeploymentEvent{
-		EventID:      newEventID(),
+		EventID:      deploymentEventID(request.DeploymentID, "build", buildFailedStatus),
 		DeploymentID: request.DeploymentID,
 		ProjectID:    request.ProjectID,
 		ServiceName:  firstNonEmpty(request.ServiceName, request.Payload.ServiceAlias),
@@ -169,6 +170,11 @@ func newBuildFailedDeploymentEvent(
 			"containerPort": request.Payload.ContainerPort,
 		},
 	}
+}
+
+func deploymentEventID(deploymentID, stage, status string) string {
+	sum := sha256.Sum256([]byte(deploymentID + ":" + stage + ":" + status))
+	return hex.EncodeToString(sum[:])
 }
 
 func firstNonEmpty(values ...string) string {
