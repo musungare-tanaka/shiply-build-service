@@ -59,6 +59,10 @@ func (p *RabbitPublisher) PublishProgressJSON(ctx context.Context, exchange, rou
 	return p.publishJSON(ctx, exchange, routingKey, payload, true)
 }
 
+func (p *RabbitPublisher) Publish(ctx context.Context, exchange, routingKey string, message amqp091.Publishing) error {
+	return p.publish(ctx, exchange, routingKey, false, message)
+}
+
 func (p *RabbitPublisher) publishJSON(ctx context.Context, exchange, routingKey string, payload any, mandatory bool) error {
 	if p == nil || p.ch == nil {
 		return errors.New("rabbitmq publish channel is not initialized")
@@ -69,16 +73,23 @@ func (p *RabbitPublisher) publishJSON(ctx context.Context, exchange, routingKey 
 		return fmt.Errorf("marshal event payload: %w", err)
 	}
 
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	messageID := fmt.Sprintf("%d", time.Now().UTC().UnixNano())
-	confirmation, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, routingKey, mandatory, false, amqp091.Publishing{
+	return p.publish(ctx, exchange, routingKey, mandatory, amqp091.Publishing{
 		ContentType:  "application/json",
 		DeliveryMode: amqp091.Persistent,
 		Timestamp:    time.Now().UTC(),
 		MessageId:    messageID,
 		Body:         body,
 	})
+}
+
+func (p *RabbitPublisher) publish(ctx context.Context, exchange, routingKey string, mandatory bool, message amqp091.Publishing) error {
+	if p == nil || p.ch == nil {
+		return errors.New("rabbitmq publish channel is not initialized")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	confirmation, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, exchange, routingKey, mandatory, false, message)
 	if err != nil {
 		return fmt.Errorf("publish rabbitmq event: %w", err)
 	}

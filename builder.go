@@ -64,6 +64,20 @@ func (b *CommandBuilder) BuildAndPush(ctx context.Context, request BuildRequest)
 		return result, err
 	}
 	result.ImageTag = imageTag
+	dockerEnv, err := b.registryDockerEnv(ctx, request.WorkDir)
+	if err != nil {
+		return result, err
+	}
+	defer func() {
+		if _, removeErr := b.run(context.Background(), commandSpec{Name: "docker", Args: []string{"image", "rm", "-f", imageTag}}); removeErr != nil {
+			log.Printf("remove local image failed for image=%s: %v", imageTag, removeErr)
+		}
+	}()
+
+	if b.imageExists(ctx, imageTag, dockerEnv) {
+		result.Builder = "registry"
+		return result, nil
+	}
 
 	builderName, err := b.buildImage(ctx, request.RepositoryDir, imageTag)
 	result.Builder = builderName
@@ -71,7 +85,7 @@ func (b *CommandBuilder) BuildAndPush(ctx context.Context, request BuildRequest)
 		return result, err
 	}
 
-	if err := b.pushImage(ctx, request.WorkDir, imageTag); err != nil {
+	if err := b.pushImage(ctx, imageTag, dockerEnv); err != nil {
 		return result, err
 	}
 
@@ -125,14 +139,14 @@ func (b *CommandBuilder) buildImage(ctx context.Context, repositoryDir, imageTag
 	return "dockerfile", nil
 }
 
-func (b *CommandBuilder) pushImage(ctx context.Context, workDir, imageTag string) error {
+func (b *CommandBuilder) registryDockerEnv(ctx context.Context, workDir string) (map[string]string, error) {
 	if err := validateRegistryConfig(b.cfg.Registry); err != nil {
-		return err
+		return nil, err
 	}
 
 	dockerConfigDir := filepath.Join(workDir, "docker-config")
 	if err := os.MkdirAll(dockerConfigDir, 0o700); err != nil {
-		return fmt.Errorf("create docker config dir: %w", err)
+		return nil, fmt.Errorf("create docker config dir: %w", err)
 	}
 
 	env := map[string]string{
@@ -146,9 +160,17 @@ func (b *CommandBuilder) pushImage(ctx context.Context, workDir, imageTag string
 		Env:   env,
 		Stdin: b.cfg.Registry.Password,
 	}); err != nil {
-		return fmt.Errorf("docker login failed: %w", err)
+		return nil, fmt.Errorf("docker login failed: %w", err)
 	}
+	return env, nil
+}
 
+func (b *CommandBuilder) imageExists(ctx context.Context, imageTag string, env map[string]string) bool {
+	_, err := b.run(ctx, commandSpec{Name: "docker", Args: []string{"manifest", "inspect", imageTag}, Env: env})
+	return err == nil
+}
+
+func (b *CommandBuilder) pushImage(ctx context.Context, imageTag string, env map[string]string) error {
 	log.Printf("pushing built image=%s", imageTag)
 	if _, err := b.run(ctx, commandSpec{
 		Name: "docker",

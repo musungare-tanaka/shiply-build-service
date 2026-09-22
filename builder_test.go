@@ -54,6 +54,9 @@ func TestCommandBuilderBuildAndPushUsesNixpacks(t *testing.T) {
 			case "nixpacks":
 				return "image built", nil
 			case "docker":
+				if len(spec.Args) > 1 && spec.Args[0] == "manifest" {
+					return "", errors.New("manifest unknown")
+				}
 				return "ok", nil
 			default:
 				return "", nil
@@ -83,20 +86,24 @@ func TestCommandBuilderBuildAndPushUsesNixpacks(t *testing.T) {
 		commands[1].Name + " " + strings.Join(commands[1].Args, " "),
 		commands[2].Name + " " + strings.Join(commands[2].Args, " "),
 		commands[3].Name + " " + strings.Join(commands[3].Args, " "),
+		commands[4].Name + " " + strings.Join(commands[4].Args, " "),
+		commands[5].Name + " " + strings.Join(commands[5].Args, " "),
 	}
 	wantCommands := []string{
 		"git rev-parse HEAD",
-		"nixpacks build /tmp/repo --name ghcr.io/project-one/api:abcdef123456",
 		"docker login ghcr.io --username shiply --password-stdin",
+		"docker manifest inspect ghcr.io/project-one/api:abcdef123456",
+		"nixpacks build /tmp/repo --name ghcr.io/project-one/api:abcdef123456",
 		"docker push ghcr.io/project-one/api:abcdef123456",
+		"docker image rm -f ghcr.io/project-one/api:abcdef123456",
 	}
 	if !reflect.DeepEqual(gotCommands, wantCommands) {
 		t.Fatalf("unexpected commands: %#v", gotCommands)
 	}
-	if commands[2].Stdin != "secret" {
+	if commands[1].Stdin != "secret" {
 		t.Fatalf("expected registry password on stdin")
 	}
-	if commands[2].Env["DOCKER_CONFIG"] == "" {
+	if commands[1].Env["DOCKER_CONFIG"] == "" {
 		t.Fatalf("expected DOCKER_CONFIG to be set for docker login")
 	}
 }
@@ -128,6 +135,9 @@ func TestCommandBuilderBuildAndPushFallsBackToDockerfile(t *testing.T) {
 			case "nixpacks":
 				return "", errors.New("no build plan")
 			case "docker":
+				if len(spec.Args) > 1 && spec.Args[0] == "manifest" {
+					return "", errors.New("manifest unknown")
+				}
 				return "ok", nil
 			default:
 				return "", nil
@@ -176,6 +186,11 @@ func TestCommandBuilderBuildAndPushFailsWithoutDockerfileAfterNixpacks(t *testin
 				return "abcdef1234567890", nil
 			case "nixpacks":
 				return "", errors.New("no build plan")
+			case "docker":
+				if len(spec.Args) > 1 && spec.Args[0] == "manifest" {
+					return "", errors.New("manifest unknown")
+				}
+				return "ok", nil
 			default:
 				return "ok", nil
 			}
