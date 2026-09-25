@@ -92,10 +92,14 @@ func (l *PostgresStageLedger) Claim(ctx context.Context, id, stage string, lease
 		return ClaimAcquired, r, tx.Commit()
 	}
 	var r StageRecord
+	var resultJSON []byte
 	q := `SELECT deployment_id,stage,state,attempt,retry_count,lease_expires_at,result_json FROM ` + l.table + ` WHERE deployment_id=$1 AND stage=$2 FOR UPDATE`
-	err = tx.QueryRowContext(ctx, q, id, stage).Scan(&r.DeploymentID, &r.Stage, &r.State, &r.Attempt, &r.RetryCount, &r.LeaseExpiresAt, &r.ResultJSON)
+	err = tx.QueryRowContext(ctx, q, id, stage).Scan(&r.DeploymentID, &r.Stage, &r.State, &r.Attempt, &r.RetryCount, &r.LeaseExpiresAt, &resultJSON)
 	if err != nil {
 		return 0, r, err
+	}
+	if resultJSON != nil {
+		r.ResultJSON = json.RawMessage(resultJSON)
 	}
 	if r.State == StateCompleted {
 		return ClaimCompleted, r, tx.Commit()
