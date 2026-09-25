@@ -21,6 +21,10 @@
 - `RABBITMQ_DEPLOYMENT_BUILD_STARTED_ROUTING_KEY=deployment.build.started`
 - `RABBITMQ_DEPLOYMENT_BUILD_SUCCEEDED_ROUTING_KEY=deployment.build.succeeded`
 - `RABBITMQ_DEPLOYMENT_BUILD_FAILED_ROUTING_KEY=deployment.build.failed`
+- `MAX_DELIVERY_ATTEMPTS=5` (the initial delivery is attempt one)
+- `RETRY_BACKOFF_SCHEDULE=10s,30s,2m,5m`
+- `RABBITMQ_RETRY_QUEUE_PREFIX=shiply.app.build.retry`
+- `RABBITMQ_BUILD_DLQ=shiply.app.build.dlq`
 - `GITHUB_APP_ID`
 - `GITHUB_APP_PRIVATE_KEY` or `GITHUB_APP_PRIVATE_KEY_BASE64`
 - `CONTAINER_REGISTRY_HOST`
@@ -34,6 +38,7 @@
 - `docker`
 
 ## Build behavior
+- Claim and build failures are retried through durable TTL queues. Retry exhaustion is persisted as `FAILED` before `build.failed` and `deployment.build.failed` are published.
 - The worker tags images as `<registry-host>/<optional-prefix>/<project-id>/<service-id>:<short-commit-sha>`.
 - The worker tries `nixpacks build <repoDir> --name <imageRef>` first.
 - If Nixpacks fails, the worker checks for a repo-root `Dockerfile` and falls back to `docker build -t <imageRef> <repoDir>`.

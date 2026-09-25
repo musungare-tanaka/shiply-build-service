@@ -28,7 +28,10 @@ var (
 	actionNackRequeue = deliveryAction{requeue: true}
 )
 
-var errBuildLeaseBusy = errors.New("build stage lease is owned by another worker")
+var (
+	errBuildLeaseBusy      = errors.New("build stage lease is owned by another worker")
+	errStoredResultPublish = errors.New("publish stored terminal build result")
+)
 
 type BuildConsumer struct {
 	cfg    Config
@@ -218,7 +221,11 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 		}
 		switch disposition {
 		case ClaimCompleted, ClaimFailed:
-			return c.publishStored(record.ResultJSON)
+			action, publishErr := c.publishStored(record.ResultJSON)
+			if publishErr != nil {
+				return action, fmt.Errorf("%w: %v", errStoredResultPublish, publishErr)
+			}
+			return action, nil
 		case ClaimBusy:
 			return actionNackRequeue, errBuildLeaseBusy
 		}
@@ -377,12 +384,31 @@ func declareRetryTopology(ch *amqp091.Channel, cfg Config) error {
 }
 func (c *BuildConsumer) scheduleRetry(msg amqp091.Delivery, cause error, countAttempt bool) error {
 	attempt := headerAttempt(msg.Headers)
-	if countAttempt {
+	retryPersisted := false
+	if c.ledger != nil {
+		var event ServiceEvent[ApplicationBuildRequestedPayload]
+		if json.Unmarshal(msg.Body, &event) == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			persistedAttempt, persistErr := c.ledger.RecordRetry(ctx, event.DeploymentID, "build", safeReason(cause))
+			cancel()
+			if persistErr != nil {
+				log.Printf("persist retry attempt failed; using message header fallback: %v", persistErr)
+				attempt++
+			} else {
+				retryPersisted = true
+				if persistedAttempt > attempt {
+					attempt = persistedAttempt
+				}
+			}
+		}
+	} else {
 		attempt++
 	}
 	if attempt >= c.cfg.MaxAttempts {
-		if err := c.emitExhausted(msg.Body, cause); err != nil {
-			return err
+		if countAttempt && !errors.Is(cause, errStoredResultPublish) {
+			if err := c.emitExhausted(msg.Body, cause); err != nil {
+				return err
+			}
 		}
 		return c.copyToDLQWithAttempt(msg, cause, attempt)
 	}
@@ -403,16 +429,33 @@ func (c *BuildConsumer) scheduleRetry(msg amqp091.Delivery, cause error, countAt
 	headers["x-shiply-retry-reason"] = safeReason(cause)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if c.pub == nil {
-		return errors.New("rabbitmq publisher is not initialized")
-	}
-	if err := c.pub.Publish(ctx, "", fmt.Sprintf("%s.%d", c.cfg.RetryQueuePrefix, idx+1), amqp091.Publishing{ContentType: msg.ContentType, DeliveryMode: amqp091.Persistent, Headers: headers, Body: msg.Body}); err != nil {
-		return err
-	}
+	// Release the execution lease before publishing the delayed copy. If the
+	// publish fails, broker redelivery can reacquire the stage and the durable
+	// retry counter still prevents an immediate, unbounded requeue loop.
 	if countAttempt {
-		return c.releaseClaim(ctx, msg.Body)
+		if err := c.releaseClaim(ctx, msg.Body); err != nil {
+			log.Printf("release build claim before retry failed: %v", err)
+		}
 	}
-	return nil
+	publishing := amqp091.Publishing{ContentType: msg.ContentType, DeliveryMode: amqp091.Persistent, Headers: headers, Body: msg.Body}
+	retryQueue := fmt.Sprintf("%s.%d", c.cfg.RetryQueuePrefix, idx+1)
+	if c.pub != nil {
+		if err := c.pub.Publish(ctx, "", retryQueue, publishing); err == nil {
+			return nil
+		} else {
+			log.Printf("retry publish on publisher channel failed; trying consumer channel: %v", err)
+		}
+	}
+	if c.ch != nil {
+		if err := c.ch.PublishWithContext(ctx, "", retryQueue, false, false, publishing); err == nil {
+			return nil
+		} else if retryPersisted {
+			return fmt.Errorf("publish durable retry: %w", err)
+		} else {
+			return fmt.Errorf("publish retry: %w", err)
+		}
+	}
+	return errors.New("rabbitmq retry publisher is not initialized")
 }
 func (c *BuildConsumer) emitRetrying(body []byte, attempt int, cause error) error {
 	var event ServiceEvent[ApplicationBuildRequestedPayload]

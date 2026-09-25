@@ -35,3 +35,32 @@ func TestStageLedgerClaimLifecycle(t *testing.T) {
 		t.Fatalf("completed claim = %v %#v", disposition, record)
 	}
 }
+
+func TestStageLedgerRetryCountSurvivesReleaseAndClaim(t *testing.T) {
+	ledger := newMemoryStageLedger()
+	ctx := context.Background()
+
+	_, _, err := ledger.Claim(ctx, "deployment-retry", "build", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for expected := 1; expected <= 5; expected++ {
+		actual, retryErr := ledger.RecordRetry(ctx, "deployment-retry", "build", "temporary failure")
+		if retryErr != nil {
+			t.Fatal(retryErr)
+		}
+		if actual != expected {
+			t.Fatalf("expected retry count %d, got %d", expected, actual)
+		}
+	}
+	if err := ledger.Release(ctx, "deployment-retry", "build"); err != nil {
+		t.Fatal(err)
+	}
+	_, record, err := ledger.Claim(ctx, "deployment-retry", "build", time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.RetryCount != 5 {
+		t.Fatalf("expected durable retry count 5, got %d", record.RetryCount)
+	}
+}

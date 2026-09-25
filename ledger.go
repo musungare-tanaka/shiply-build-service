@@ -34,6 +34,7 @@ type StageRecord struct {
 	Stage          string
 	State          StageState
 	Attempt        int
+	RetryCount     int
 	LeaseExpiresAt sql.NullTime
 	ResultJSON     json.RawMessage
 }
@@ -43,6 +44,7 @@ type StageLedger interface {
 	Complete(context.Context, string, string, any) error
 	Fail(context.Context, string, string, any) error
 	Release(context.Context, string, string) error
+	RecordRetry(context.Context, string, string, string) (int, error)
 	Close() error
 }
 type PostgresStageLedger struct {
@@ -90,8 +92,8 @@ func (l *PostgresStageLedger) Claim(ctx context.Context, id, stage string, lease
 		return ClaimAcquired, r, tx.Commit()
 	}
 	var r StageRecord
-	q := `SELECT deployment_id,stage,state,attempt,lease_expires_at,result_json FROM ` + l.table + ` WHERE deployment_id=$1 AND stage=$2 FOR UPDATE`
-	err = tx.QueryRowContext(ctx, q, id, stage).Scan(&r.DeploymentID, &r.Stage, &r.State, &r.Attempt, &r.LeaseExpiresAt, &r.ResultJSON)
+	q := `SELECT deployment_id,stage,state,attempt,retry_count,lease_expires_at,result_json FROM ` + l.table + ` WHERE deployment_id=$1 AND stage=$2 FOR UPDATE`
+	err = tx.QueryRowContext(ctx, q, id, stage).Scan(&r.DeploymentID, &r.Stage, &r.State, &r.Attempt, &r.RetryCount, &r.LeaseExpiresAt, &r.ResultJSON)
 	if err != nil {
 		return 0, r, err
 	}
@@ -133,6 +135,11 @@ func (l *PostgresStageLedger) Fail(ctx context.Context, id, stage string, result
 func (l *PostgresStageLedger) Release(ctx context.Context, id, stage string) error {
 	_, err := l.db.ExecContext(ctx, `UPDATE `+l.table+` SET state=$3,lease_expires_at=NULL,updated_at=now() WHERE deployment_id=$1 AND stage=$2`, id, stage, StateInProgress)
 	return err
+}
+func (l *PostgresStageLedger) RecordRetry(ctx context.Context, id, stage, reason string) (int, error) {
+	var count int
+	err := l.db.QueryRowContext(ctx, `UPDATE `+l.table+` SET retry_count=retry_count+1,last_error=$3,updated_at=now() WHERE deployment_id=$1 AND stage=$2 RETURNING retry_count`, id, stage, reason).Scan(&count)
+	return count, err
 }
 
 type memoryStageLedger struct {
@@ -196,5 +203,11 @@ func (m *memoryStageLedger) Release(_ context.Context, id, stage string) error {
 	r.LeaseExpiresAt = sql.NullTime{}
 	m.records[m.key(id, stage)] = r
 	return nil
+}
+func (m *memoryStageLedger) RecordRetry(_ context.Context, id, stage, reason string) (int, error) {
+	r := m.records[m.key(id, stage)]
+	r.RetryCount++
+	m.records[m.key(id, stage)] = r
+	return r.RetryCount, nil
 }
 func (m *memoryStageLedger) Close() error { return nil }
