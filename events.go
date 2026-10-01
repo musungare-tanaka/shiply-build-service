@@ -106,7 +106,7 @@ func newBuildFailedEvent(
 			ImageTag:     result.ImageTag,
 			CommitSHA:    result.CommitSHA,
 			Builder:      result.Builder,
-			ErrorMessage: redact(err.Error()),
+			ErrorMessage: sanitizeStoredText(redact(err.Error())),
 		},
 	}
 }
@@ -170,7 +170,7 @@ func newBuildFailedDeploymentEvent(
 			"imageTag":      result.ImageTag,
 			"commitSha":     result.CommitSHA,
 			"builder":       result.Builder,
-			"errorMessage":  redact(err.Error()),
+			"errorMessage":  sanitizeStoredText(redact(err.Error())),
 			"projectSlug":   request.Payload.ProjectSlug,
 			"serviceSlug":   request.Payload.ServiceSlug,
 			"containerPort": request.Payload.ContainerPort,

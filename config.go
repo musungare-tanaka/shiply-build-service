@@ -58,7 +58,7 @@ func loadConfig() Config {
 		DeploymentBuildRetryingRoutingKey:  envOrDefault("RABBITMQ_DEPLOYMENT_BUILD_RETRYING_ROUTING_KEY", "deployment.build.retrying"),
 		DatabaseURL:                        os.Getenv("DATABASE_URL"),
 		LedgerSchema:                       envOrDefault("STAGE_LEDGER_SCHEMA", "build_service"),
-		LeaseDuration:                      durationOrDefault("STAGE_LEASE_DURATION", 35*time.Minute),
+		LeaseDuration:                      durationOrDefault("STAGE_LEASE_DURATION", 2*time.Hour),
 		MaxAttempts:                        intOrDefault("MAX_DELIVERY_ATTEMPTS", 5),
 		RetryBackoffs:                      durationsOrDefault("RETRY_BACKOFF_SCHEDULE", []time.Duration{10 * time.Second, 30 * time.Second, 2 * time.Minute, 5 * time.Minute}),
 		RetryQueuePrefix:                   envOrDefault("RABBITMQ_RETRY_QUEUE_PREFIX", "shiply.app.build.retry"),

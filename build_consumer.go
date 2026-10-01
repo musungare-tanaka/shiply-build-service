@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/rabbitmq/amqp091-go"
@@ -43,6 +44,39 @@ type BuildConsumer struct {
 	cloneRepositoryFn func(ApplicationBuildRequestedPayload, string) error
 	buildExecutor     BuildExecutor
 	publishFn         publishFunc
+	jobs              chan buildJob
+	connectedAt       atomic.Int64
+	disconnectedAt    atomic.Int64
+}
+
+type buildJob struct {
+	event       ServiceEvent[ApplicationBuildRequestedPayload]
+	body        []byte
+	headers     amqp091.Table
+	contentType string
+}
+
+const buildConcurrency = 1
+
+func consumerBackoff(attempt int) time.Duration {
+	d := time.Second
+	for i := 0; i < attempt && d < 30*time.Second; i++ {
+		d *= 2
+	}
+	if d > 30*time.Second {
+		return 30 * time.Second
+	}
+	return d
+}
+
+func sanitizeStoredText(s string) string {
+	s = strings.ToValidUTF8(s, "")
+	s = strings.ReplaceAll(s, "\x00", "")
+	r := []rune(s)
+	if len(r) > 2000 {
+		r = r[len(r)-2000:]
+	}
+	return string(r)
 }
 
 type buildResultEvents struct {
@@ -70,63 +104,10 @@ type ApplicationBuildRequestedPayload struct {
 }
 
 func NewBuildConsumer(cfg Config) (*BuildConsumer, error) {
-	conn, err := amqp091.Dial(cfg.RabbitMQURL)
-	if err != nil {
-		return nil, fmt.Errorf("connect rabbitmq: %w", err)
-	}
-
-	ch, err := conn.Channel()
-	if err != nil {
-		conn.Close()
-		return nil, fmt.Errorf("open rabbitmq channel: %w", err)
-	}
-
-	if err := ch.ExchangeDeclare(cfg.RabbitMQExchange, "direct", true, false, false, false, nil); err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, fmt.Errorf("declare exchange: %w", err)
-	}
-
-	queue, err := ch.QueueDeclare(cfg.ApplicationBuildQueue, true, false, false, false, nil)
-	if err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, fmt.Errorf("declare queue: %w", err)
-	}
-
-	if err := ch.QueueBind(queue.Name, cfg.ApplicationRoutingKey, cfg.RabbitMQExchange, false, nil); err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, fmt.Errorf("bind queue: %w", err)
-	}
-	if err := declareRetryTopology(ch, cfg); err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, err
-	}
-
-	if err := ch.Qos(1, 0, false); err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, fmt.Errorf("set qos: %w", err)
-	}
-
-	publisher, err := NewRabbitPublisher(conn, []ExchangeSpec{
-		{Name: cfg.RabbitMQExchange, Kind: "direct"},
-		{Name: cfg.DeploymentExchange, Kind: "topic"},
-	})
-	if err != nil {
-		ch.Close()
-		conn.Close()
-		return nil, fmt.Errorf("initialize publisher: %w", err)
-	}
-
 	consumer := &BuildConsumer{
 		cfg:           cfg,
-		conn:          conn,
-		ch:            ch,
-		pub:           publisher,
 		buildExecutor: NewCommandBuilder(cfg),
+		jobs:          make(chan buildJob, buildConcurrency),
 	}
 	ledger, err := NewPostgresStageLedger(context.Background(), cfg.DatabaseURL, cfg.LedgerSchema)
 	if err != nil {
@@ -137,6 +118,48 @@ func NewBuildConsumer(cfg Config) (*BuildConsumer, error) {
 	consumer.cloneRepositoryFn = consumer.cloneRepository
 	consumer.publishFn = consumer.publishJSONEvent
 	return consumer, nil
+}
+
+func (c *BuildConsumer) connect() error {
+	conn, err := amqp091.Dial(c.cfg.RabbitMQURL)
+	if err != nil {
+		return fmt.Errorf("connect rabbitmq: %w", err)
+	}
+	ch, err := conn.Channel()
+	if err != nil {
+		_ = conn.Close()
+		return fmt.Errorf("open rabbitmq channel: %w", err)
+	}
+	cleanup := func() { _ = ch.Close(); _ = conn.Close() }
+	if err := ch.ExchangeDeclare(c.cfg.RabbitMQExchange, "direct", true, false, false, false, nil); err != nil {
+		cleanup()
+		return fmt.Errorf("declare exchange: %w", err)
+	}
+	queue, err := ch.QueueDeclare(c.cfg.ApplicationBuildQueue, true, false, false, false, nil)
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("declare queue: %w", err)
+	}
+	if err := ch.QueueBind(queue.Name, c.cfg.ApplicationRoutingKey, c.cfg.RabbitMQExchange, false, nil); err != nil {
+		cleanup()
+		return fmt.Errorf("bind queue: %w", err)
+	}
+	if err := declareRetryTopology(ch, c.cfg); err != nil {
+		cleanup()
+		return err
+	}
+	if err := ch.Qos(buildConcurrency, 0, false); err != nil {
+		cleanup()
+		return fmt.Errorf("set qos: %w", err)
+	}
+	pub, err := NewRabbitPublisher(conn, []ExchangeSpec{{Name: c.cfg.RabbitMQExchange, Kind: "direct"}, {Name: c.cfg.DeploymentExchange, Kind: "topic"}})
+	if err != nil {
+		cleanup()
+		return fmt.Errorf("initialize publisher: %w", err)
+	}
+	c.conn, c.ch, c.pub = conn, ch, pub
+	c.disconnectedAt.Store(0)
+	return nil
 }
 
 func (c *BuildConsumer) Close() {
@@ -154,17 +177,154 @@ func (c *BuildConsumer) Close() {
 	}
 }
 
-func (c *BuildConsumer) Start() error {
-	msgs, err := c.ch.Consume(c.cfg.ApplicationBuildQueue, "", false, false, false, false, nil)
-	if err != nil {
-		return fmt.Errorf("consume queue: %w", err)
+func (c *BuildConsumer) Start(ctx context.Context) error {
+	if c.jobs == nil {
+		c.jobs = make(chan buildJob, buildConcurrency)
 	}
+	for i := 0; i < buildConcurrency; i++ {
+		go c.worker(ctx)
+	}
+	backoffAttempt := 0
+	for {
+		if ctx.Err() != nil {
+			return nil
+		}
+		if err := c.connect(); err != nil {
+			log.Printf("build consumer connection failed: %v", err)
+			if !waitBackoff(ctx, consumerBackoff(backoffAttempt)) {
+				return nil
+			}
+			backoffAttempt++
+			continue
+		}
+		closeNotice := c.conn.NotifyClose(make(chan *amqp091.Error, 1))
+		msgs, err := c.ch.Consume(c.cfg.ApplicationBuildQueue, "", false, false, false, false, nil)
+		if err != nil {
+			log.Printf("build consumer consume failed: %v", err)
+		} else {
+			c.connectedAt.Store(time.Now().UnixNano())
+			backoffAttempt = 0
+			log.Printf("build consumer connected")
+			for {
+				select {
+				case <-ctx.Done():
+					c.disconnect()
+					return nil
+				case closeErr := <-closeNotice:
+					if closeErr != nil {
+						log.Printf("build consumer connection closed: %v", closeErr)
+					}
+					goto reconnect
+				case msg, ok := <-msgs:
+					if !ok {
+						log.Printf("build consumer deliveries channel closed")
+						goto reconnect
+					}
+					c.acceptDelivery(msg)
+				}
+			}
+		}
+	reconnect:
+		c.disconnect()
+		if !waitBackoff(ctx, consumerBackoff(backoffAttempt)) {
+			return nil
+		}
+		backoffAttempt++
+	}
+}
 
-	for msg := range msgs {
+func waitBackoff(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+func (c *BuildConsumer) disconnect() {
+	c.connectedAt.Store(0)
+	if c.disconnectedAt.Load() == 0 {
+		c.disconnectedAt.Store(time.Now().UnixNano())
+	}
+	if c.pub != nil {
+		_ = c.pub.Close()
+		c.pub = nil
+	}
+	if c.ch != nil {
+		_ = c.ch.Close()
+		c.ch = nil
+	}
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+}
+func (c *BuildConsumer) Unhealthy() bool {
+	started := c.disconnectedAt.Load()
+	return started != 0 && time.Since(time.Unix(0, started)) > 2*time.Minute
+}
+func (c *BuildConsumer) Connected() bool { return c.connectedAt.Load() != 0 }
+func (c *BuildConsumer) acceptDelivery(msg amqp091.Delivery) {
+	var event ServiceEvent[ApplicationBuildRequestedPayload]
+	if err := json.Unmarshal(msg.Body, &event); err != nil {
 		c.processDelivery(msg)
+		return
 	}
-
-	return errors.New("rabbitmq consumer channel closed")
+	if strings.TrimSpace(event.DeploymentID) == "" || validateBuildPayload(event.Payload) != nil {
+		c.processDelivery(msg)
+		return
+	}
+	if c.ledger != nil {
+		disposition, record, err := c.ledger.Claim(context.Background(), event.DeploymentID, "build", c.cfg.LeaseDuration)
+		if err != nil {
+			log.Printf("claim build stage failed: %v", err)
+			_ = msg.Nack(false, true)
+			return
+		}
+		switch disposition {
+		case ClaimBusy:
+			_ = msg.Nack(false, true)
+			return
+		case ClaimCompleted, ClaimFailed:
+			action, err := c.publishStored(record.ResultJSON)
+			if err != nil {
+				log.Printf("publish stored result failed: %v", err)
+				_ = msg.Nack(false, true)
+				return
+			}
+			if action.ack {
+				_ = msg.Ack(false)
+			} else {
+				_ = msg.Nack(false, action.requeue)
+			}
+			return
+		}
+	}
+	if err := msg.Ack(false); err != nil {
+		log.Printf("early build ack failed: %v", err)
+		return
+	}
+	select {
+	case c.jobs <- buildJob{event: event, body: append([]byte(nil), msg.Body...), headers: cloneHeaders(msg.Headers), contentType: msg.ContentType}:
+	default:
+		job := buildJob{event: event, body: append([]byte(nil), msg.Body...), headers: cloneHeaders(msg.Headers), contentType: msg.ContentType}
+		go func() { c.jobs <- job }()
+	}
+}
+func (c *BuildConsumer) worker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case job := <-c.jobs:
+			if ctx.Err() != nil {
+				return
+			}
+			c.runBuildEvent(ctx, job)
+		}
+	}
 }
 
 func (c *BuildConsumer) processDelivery(msg amqp091.Delivery) {
@@ -210,8 +370,7 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 	if strings.TrimSpace(event.DeploymentID) == "" {
 		return actionNackDrop, errors.New("missing deploymentId")
 	}
-	payload := event.Payload
-	if err := validateBuildPayload(payload); err != nil {
+	if err := validateBuildPayload(event.Payload); err != nil {
 		return actionNackDrop, err
 	}
 	if c.ledger != nil {
@@ -221,23 +380,41 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 		}
 		switch disposition {
 		case ClaimCompleted, ClaimFailed:
-			action, publishErr := c.publishStored(record.ResultJSON)
-			if publishErr != nil {
-				return action, fmt.Errorf("%w: %v", errStoredResultPublish, publishErr)
-			}
-			return action, nil
+			return c.publishStored(record.ResultJSON)
 		case ClaimBusy:
 			return actionNackRequeue, errBuildLeaseBusy
 		}
 	}
+	return c.handleClaimedBuildEvent(event)
+}
 
+func (c *BuildConsumer) runBuildEvent(ctx context.Context, job buildJob) {
+	if action, err := c.executeBuildEvent(ctx, job.event); !action.ack && err != nil {
+		log.Printf("asynchronously processed build failed deployment=%s: %s", job.event.DeploymentID, redact(err.Error()))
+		msg := amqp091.Delivery{Body: job.body, Headers: job.headers, ContentType: job.contentType}
+		if action.requeue {
+			if retryErr := c.scheduleRetry(msg, err, !errors.Is(err, errBuildLeaseBusy)); retryErr != nil {
+				log.Printf("schedule asynchronous build retry failed: %v", retryErr)
+			}
+		} else if dlqErr := c.copyToDLQ(msg, err); dlqErr != nil {
+			log.Printf("send asynchronous build failure to dlq failed: %v", dlqErr)
+		}
+	}
+}
+
+func (c *BuildConsumer) executeBuildEvent(_ context.Context, event ServiceEvent[ApplicationBuildRequestedPayload]) (deliveryAction, error) {
+	// The claim and early acknowledgement happen in acceptDelivery. Run the
+	// existing stage body without claiming the same lease a second time.
+	return c.handleClaimedBuildEvent(event)
+}
+
+func (c *BuildConsumer) handleClaimedBuildEvent(event ServiceEvent[ApplicationBuildRequestedPayload]) (deliveryAction, error) {
 	startedEvent := newBuildStartedDeploymentEvent(event)
 	startedCtx, cancelStarted := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelStarted()
 	if err := c.publishProgressEvent(startedCtx, c.cfg.DeploymentExchange, c.cfg.DeploymentBuildStartedRoutingKey, startedEvent); err != nil {
 		return actionNackRequeue, fmt.Errorf("publish build started event: %w", err)
 	}
-
 	targetDir, err := os.MkdirTemp("", "shiply-build-*")
 	if err != nil {
 		return c.completeFailure(event, BuildResult{}, fmt.Errorf("create workdir: %w", err))
@@ -247,44 +424,28 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 			log.Printf("cleanup failed for %s: %v", targetDir, removeErr)
 		}
 	}()
-
-	repositoryDir := filepath.Join(targetDir, sanitizeName(payload.ServiceAlias))
+	repositoryDir := filepath.Join(targetDir, sanitizeName(event.Payload.ServiceAlias))
 	cloneFn := c.cloneRepositoryFn
 	if cloneFn == nil {
 		cloneFn = c.cloneRepository
 	}
-	if err := cloneFn(payload, repositoryDir); err != nil {
+	if err := cloneFn(event.Payload, repositoryDir); err != nil {
 		return c.completeFailure(event, BuildResult{}, err)
 	}
-
-	log.Printf(
-		"build source prepared for service=%s project=%s branch=%s path=%s",
-		sanitizeName(payload.ServiceAlias),
-		event.ProjectID,
-		payload.Branch,
-		repositoryDir,
-	)
-
+	log.Printf("build source prepared for service=%s project=%s branch=%s path=%s", sanitizeName(event.Payload.ServiceAlias), event.ProjectID, event.Payload.Branch, repositoryDir)
 	builder := c.buildExecutor
 	if builder == nil {
 		builder = NewCommandBuilder(c.cfg)
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()
 	stopRenew := c.startLeaseRenewal(ctx, event.DeploymentID)
 	defer stopRenew()
-
-	result, err := builder.BuildAndPush(ctx, BuildRequest{
-		ProjectID:     event.ProjectID,
-		ServiceID:     event.ServiceID,
-		RepositoryDir: repositoryDir,
-		WorkDir:       targetDir,
-	})
+	result, err := builder.BuildAndPush(ctx, BuildRequest{ProjectID: event.ProjectID, ServiceID: event.ServiceID, RepositoryDir: repositoryDir, WorkDir: targetDir})
 	if err != nil {
-		return actionNackRequeue, err
+		_, failureErr := c.completeFailure(event, BuildResult{}, err)
+		return actionAck, failureErr
 	}
-
 	successEvent := newBuildSucceededEvent(event, result)
 	bundle, err := makeBuildResultEvents(c.cfg.BuildSucceededRoutingKey, successEvent, c.cfg.DeploymentBuildSucceededRoutingKey, newBuildSucceededDeploymentEvent(event, result))
 	if err != nil {
@@ -301,14 +462,6 @@ func (c *BuildConsumer) handleBuildEvent(event ServiceEvent[ApplicationBuildRequ
 	if err := c.publishProgressEvent(ctx, c.cfg.DeploymentExchange, c.cfg.DeploymentBuildSucceededRoutingKey, newBuildSucceededDeploymentEvent(event, result)); err != nil {
 		return actionNackRequeue, fmt.Errorf("publish deployment build succeeded event: %w", err)
 	}
-
-	log.Printf(
-		"build succeeded for service=%s project=%s image=%s builder=%s",
-		event.ServiceID,
-		event.ProjectID,
-		result.ImageTag,
-		result.Builder,
-	)
 	return actionAck, nil
 }
 
@@ -513,11 +666,7 @@ func safeReason(err error) string {
 	if err == nil {
 		return "unspecified"
 	}
-	s := redact(err.Error())
-	if len(s) > 500 {
-		return s[:500]
-	}
-	return s
+	return sanitizeStoredText(redact(err.Error()))
 }
 func (c *BuildConsumer) emitExhausted(body []byte, cause error) error {
 	var event ServiceEvent[ApplicationBuildRequestedPayload]

@@ -18,17 +18,24 @@ func main() {
 		log.Fatalf("failed to initialize build consumer: %v", err)
 	}
 	defer consumer.Close()
+	ctx, cancelConsumer := context.WithCancel(context.Background())
+	defer cancelConsumer()
 
 	go func() {
-		if err := consumer.Start(); err != nil {
-			log.Fatalf("build consumer stopped: %v", err)
+		if err := consumer.Start(ctx); err != nil {
+			log.Printf("build consumer stopped: %v", err)
 		}
 	}()
 
 	server := &http.Server{
 		Addr:              ":" + cfg.HTTPPort,
 		ReadHeaderTimeout: 5 * time.Second,
-		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/health" && consumer.Unhealthy() {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = w.Write([]byte("consumer disconnected"))
+				return
+			}
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
 		}),
@@ -45,6 +52,7 @@ func main() {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 	<-stop
+	cancelConsumer()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

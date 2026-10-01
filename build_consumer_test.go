@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/rabbitmq/amqp091-go"
 )
@@ -121,7 +123,36 @@ func TestProcessDeliveryAcksAfterPublishingBuildSucceeded(t *testing.T) {
 	}
 }
 
-func TestProcessDeliveryRetriesBuildFailure(t *testing.T) {
+func TestSanitizeStoredText(t *testing.T) {
+	tests := []struct{ name, input, want string }{
+		{"truncated multibyte", "tail\xe2\x94", "tail"},
+		{"nuls", "a\x00b", "ab"},
+		{"box drawing", "┌─┐\n│x│", "┌─┐\n│x│"},
+		{"short", "hello", "hello"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sanitizeStoredText(tc.input); got != tc.want {
+				t.Fatalf("sanitizeStoredText() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	long := strings.Repeat("界", 2001)
+	if got := sanitizeStoredText(long); len([]rune(got)) != 2000 {
+		t.Fatalf("expected 2000 runes, got %d", len([]rune(got)))
+	}
+}
+
+func TestConsumerBackoff(t *testing.T) {
+	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
+	for i, d := range want {
+		if got := consumerBackoff(i); got != d {
+			t.Fatalf("consumerBackoff(%d) = %s, want %s", i, got, d)
+		}
+	}
+}
+
+func TestProcessDeliveryAcksBuildFailureAfterEarlyAckModel(t *testing.T) {
 	t.Parallel()
 
 	buildExecutor := &stubBuildExecutor{
@@ -154,11 +185,11 @@ func TestProcessDeliveryRetriesBuildFailure(t *testing.T) {
 		DeliveryTag:  2,
 	})
 
-	if recorder.ackCount != 0 {
-		t.Fatalf("expected no ack, got %d", recorder.ackCount)
+	if recorder.ackCount != 1 {
+		t.Fatalf("expected delivery to be acknowledged, got %d", recorder.ackCount)
 	}
-	if recorder.nackCount != 1 || !recorder.lastRequeue {
-		t.Fatalf("expected nack with requeue, got nack=%d requeue=%v", recorder.nackCount, recorder.lastRequeue)
+	if recorder.nackCount != 0 {
+		t.Fatalf("expected no nack after early acknowledgement, got %d", recorder.nackCount)
 	}
 	if _, err := os.Stat(buildExecutor.workDir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("expected workdir to be cleaned up, stat err=%v", err)
