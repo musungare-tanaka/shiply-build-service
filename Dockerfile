@@ -1,3 +1,5 @@
+ARG BUILDX_VERSION=0.37.1
+
 # -------- Build stage --------
 FROM golang:1.25.11-bookworm AS build
 WORKDIR /app
@@ -29,6 +31,9 @@ RUN apt-get update \
     && chmod 0755 /usr/local/bin/nixpacks \
     && nixpacks --version \
     && rm -rf /var/lib/apt/lists/*
+
+COPY --from=docker/buildx-bin:${BUILDX_VERSION} /buildx /usr/libexec/docker/cli-plugins/docker-buildx
+RUN chmod 0755 /usr/libexec/docker/cli-plugins/docker-buildx && docker buildx version
 
 COPY --from=build /app/build-service /app/build-service
 
